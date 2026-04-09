@@ -12,30 +12,36 @@ class Settings:
     database_url: str
     coinalyze_api_key: str
     max_symbols_per_request: int = 10
-    min_request_interval_seconds: float = 2.0
+    min_request_interval_seconds: float = 20.0
     backoff_jitter_ratio: float = 0.10
     probe_chunk_days: int = 30
     backfill_chunk_days: int = 30
     active_window_probe_days: int = 14
     max_candidate_markets_per_run: int = 1
     max_backfill_chunks_per_market_per_run: int = 1
+    live_poll_lag_seconds: float = 10.0
+    live_lookback_closed_buckets: int = 2
+    live_idle_sleep_seconds: float = 5.0
 
     @classmethod
     def from_env(cls) -> "Settings":
-        load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
+        load_dotenv(dotenv_path=Path.cwd() / ".env", override=True)
         database_url = _required_env("DATABASE_URL")
         api_key = _required_env("COINALYZE_API_KEY")
         return cls(
             database_url=database_url,
             coinalyze_api_key=api_key,
             max_symbols_per_request=int(os.getenv("MAX_SYMBOLS_PER_REQUEST", "10")),
-            min_request_interval_seconds=float(os.getenv("MIN_REQUEST_INTERVAL_SECONDS", "2.0")),
+            min_request_interval_seconds=float(os.getenv("MIN_REQUEST_INTERVAL_SECONDS", "20.0")),
             backoff_jitter_ratio=float(os.getenv("BACKOFF_JITTER_RATIO", "0.10")),
             probe_chunk_days=int(os.getenv("PROBE_CHUNK_DAYS", "30")),
             backfill_chunk_days=int(os.getenv("BACKFILL_CHUNK_DAYS", "30")),
             active_window_probe_days=int(os.getenv("ACTIVE_WINDOW_PROBE_DAYS", "14")),
             max_candidate_markets_per_run=int(os.getenv("MAX_CANDIDATE_MARKETS_PER_RUN", "1")),
             max_backfill_chunks_per_market_per_run=int(os.getenv("MAX_BACKFILL_CHUNKS_PER_MARKET_PER_RUN", "1")),
+            live_poll_lag_seconds=float(os.getenv("LIVE_POLL_LAG_SECONDS", "10.0")),
+            live_lookback_closed_buckets=int(os.getenv("LIVE_LOOKBACK_CLOSED_BUCKETS", "2")),
+            live_idle_sleep_seconds=float(os.getenv("LIVE_IDLE_SLEEP_SECONDS", "5.0")),
         )
 
 

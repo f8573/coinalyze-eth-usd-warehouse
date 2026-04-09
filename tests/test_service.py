@@ -8,6 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from realtime_querydb.coinalyze import CoinalyzeClientError
 from realtime_querydb.config import Settings
 from realtime_querydb.models import ActivationStatus, Granularity, Market, MarketType, MetricName, UTC
 from realtime_querydb.service import (
@@ -29,6 +30,10 @@ class FakeRepository:
         self.oi = []
         self.funding = []
         self.sync_states = {}
+        self.ohlcv_store = {}
+        self.oi_store = {}
+        self.funding_store = {}
+        self.loaded_bounds = {}
 
     def apply_schema(self) -> None:
         return None
@@ -81,26 +86,45 @@ class FakeRepository:
             if state_market_id == market_id
         }
 
+    def get_loaded_bucket_bounds(self, *, market_id, granularity, metric_name):
+        return self.loaded_bounds.get((market_id, granularity, metric_name))
+
     def upsert_ohlcv_bars(self, **kwargs) -> None:
         if not kwargs["bars"]:
             return
         self.ohlcv.append(kwargs)
+        for bar in kwargs["bars"]:
+            self.ohlcv_store[(kwargs["market_id"], kwargs["granularity"], bar.bucket_start)] = bar
 
     def upsert_open_interest_bars(self, **kwargs) -> None:
         if not kwargs["bars"]:
             return
         self.oi.append(kwargs)
+        for bar in kwargs["bars"]:
+            self.oi_store[(kwargs["market_id"], kwargs["granularity"], bar.bucket_start)] = bar
 
     def upsert_funding_rate_bars(self, **kwargs) -> None:
         if not kwargs["bars"]:
             return
         self.funding.append(kwargs)
+        for bar in kwargs["bars"]:
+            self.funding_store[(kwargs["market_id"], kwargs["granularity"], bar.bucket_start)] = bar
 
 
 class FakeClient:
-    def __init__(self, history_by_key):
+    def __init__(
+        self,
+        history_by_key,
+        *,
+        max_symbols_per_request: int = 10,
+        failures_by_request=None,
+        retry_after_by_request=None,
+    ):
         self.history_by_key = history_by_key
-        self.max_symbols_per_request = 10
+        self.max_symbols_per_request = max_symbols_per_request
+        self.failures_by_request = failures_by_request or {}
+        self.retry_after_by_request = retry_after_by_request or {}
+        self.calls = []
 
     def get_exchanges(self):
         return []
@@ -112,6 +136,24 @@ class FakeClient:
         return []
 
     def get_history(self, *, symbols, metric_name, granularity, start, end_inclusive, on_retry_after=None):
+        self.calls.append(
+            {
+                "symbols": tuple(symbols),
+                "metric_name": metric_name,
+                "granularity": granularity,
+                "start": start,
+                "end_inclusive": end_inclusive,
+            }
+        )
+        request_key = (tuple(symbols), metric_name, granularity)
+        retry_after_seconds = self.retry_after_by_request.get(request_key)
+        if retry_after_seconds is not None:
+            if on_retry_after is not None:
+                on_retry_after(retry_after_seconds)
+            return {symbol: [] for symbol in symbols}
+        failure = self.failures_by_request.get(request_key)
+        if failure is not None:
+            raise failure
         start_ts = int(start.timestamp())
         end_ts = int(end_inclusive.timestamp())
         return {
@@ -136,19 +178,27 @@ class SimpleSyncState:
         self.last_error = values["last_error"]
 
 
-def make_history(start: datetime, count: int, granularity: Granularity, gap_indexes: set[int] | None = None):
+def make_history(
+    start: datetime,
+    count: int,
+    granularity: Granularity,
+    gap_indexes: set[int] | None = None,
+    value_by_index: dict[int, float] | None = None,
+):
     history = []
     current = start
     skipped = gap_indexes or set()
+    values = value_by_index or {}
     for index in range(count):
         if index not in skipped:
+            value = values.get(index, 1)
             history.append(
                 {
                     "t": int(current.timestamp()),
-                    "o": 1,
-                    "h": 1,
-                    "l": 1,
-                    "c": 1,
+                    "o": value,
+                    "h": value,
+                    "l": value,
+                    "c": value,
                     "v": 1,
                     "bv": 1,
                     "tx": 1,
@@ -681,3 +731,655 @@ class ServiceTests(unittest.TestCase):
         loaded_bars = repository.ohlcv[0]["bars"]
         self.assertEqual(loaded_bars[0].bucket_start, datetime(2026, 3, 15, 0, 0, tzinfo=UTC))
         self.assertEqual(loaded_bars[-1].bucket_start, datetime(2026, 3, 19, 23, 0, tzinfo=UTC))
+
+    def test_backfill_pending_bootstraps_sync_state_from_existing_fact_bounds(self) -> None:
+        market = Market(
+            market_id=26,
+            coinalyze_symbol="ETHUSD.L",
+            provider_code="L",
+            market_type=MarketType.SPOT,
+            base_asset="ETH",
+            quote_asset="USD",
+            symbol_on_exchange="ETH-USD",
+            is_perpetual=False,
+            margined=None,
+            oi_unit=None,
+            has_buy_sell_data=True,
+            has_ohlcv_data=True,
+            required_granularities=(Granularity.ONE_HOUR,),
+            activation_status=ActivationStatus.ACTIVE,
+            shared_complete_from=datetime(2026, 3, 1, 0, 0, tzinfo=UTC),
+            shared_complete_to=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+        )
+        repository = FakeRepository()
+        repository.markets = [market]
+        repository.loaded_bounds[(market.market_id, Granularity.ONE_HOUR, MetricName.OHLCV)] = (
+            datetime(2026, 3, 1, 0, 0, tzinfo=UTC),
+            datetime(2026, 3, 31, 23, 0, tzinfo=UTC),
+        )
+        client = FakeClient({})
+        service = WarehouseService(
+            client=client,
+            repository=repository,
+            settings=Settings(
+                database_url="postgresql://unused",
+                coinalyze_api_key="unused",
+                backfill_chunk_days=5,
+            ),
+            now=lambda: datetime(2026, 4, 10, tzinfo=UTC),
+        )
+
+        service.backfill_pending_active_markets(max_chunks_per_market=1)
+
+        self.assertEqual(client.calls, [])
+        state = repository.sync_states[(market.market_id, Granularity.ONE_HOUR, MetricName.OHLCV)]
+        self.assertEqual(state["oldest_backfilled_bucket"], datetime(2026, 3, 1, 0, 0, tzinfo=UTC))
+        self.assertEqual(state["newest_loaded_bucket"], datetime(2026, 3, 31, 23, 0, tzinfo=UTC))
+
+    def test_sync_live_once_loads_next_closed_bucket_for_spot_market(self) -> None:
+        market = Market(
+            market_id=17,
+            coinalyze_symbol="ETHUSD.C",
+            provider_code="C",
+            market_type=MarketType.SPOT,
+            base_asset="ETH",
+            quote_asset="USD",
+            symbol_on_exchange="ETH-USD",
+            is_perpetual=False,
+            margined=None,
+            oi_unit=None,
+            has_buy_sell_data=True,
+            has_ohlcv_data=True,
+            activation_status=ActivationStatus.ACTIVE,
+            shared_complete_from=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            shared_complete_to=datetime(2026, 4, 1, 1, 0, tzinfo=UTC),
+        )
+        history = {
+            (market.coinalyze_symbol, MetricName.OHLCV, Granularity.FIFTEEN_MIN): make_history(
+                datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+                4,
+                Granularity.FIFTEEN_MIN,
+            )
+        }
+        repository = FakeRepository()
+        repository.markets = [market]
+        repository.sync_states[(market.market_id, Granularity.FIFTEEN_MIN, MetricName.OHLCV)] = {
+            "market_id": market.market_id,
+            "granularity": Granularity.FIFTEEN_MIN,
+            "metric_name": MetricName.OHLCV,
+            "oldest_backfilled_bucket": datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            "newest_loaded_bucket": datetime(2026, 4, 1, 0, 15, tzinfo=UTC),
+            "retry_after_until": None,
+            "last_attempt_at": datetime(2026, 4, 1, 0, 15, tzinfo=UTC),
+            "last_error": None,
+        }
+        client = FakeClient(history)
+        service = WarehouseService(
+            client=client,
+            repository=repository,
+            settings=Settings(
+                database_url="postgresql://unused",
+                coinalyze_api_key="unused",
+                live_poll_lag_seconds=10.0,
+                live_lookback_closed_buckets=2,
+            ),
+            now=lambda: datetime(2026, 4, 1, 0, 45, 10, tzinfo=UTC),
+        )
+
+        service.sync_live_once()
+
+        self.assertIn(
+            (market.market_id, Granularity.FIFTEEN_MIN, datetime(2026, 4, 1, 0, 30, tzinfo=UTC)),
+            repository.ohlcv_store,
+        )
+        latest_state = repository.sync_states[(market.market_id, Granularity.FIFTEEN_MIN, MetricName.OHLCV)]
+        self.assertEqual(latest_state["newest_loaded_bucket"], datetime(2026, 4, 1, 0, 30, tzinfo=UTC))
+
+    def test_sync_live_once_is_idempotent_for_same_closed_bucket(self) -> None:
+        market = Market(
+            market_id=18,
+            coinalyze_symbol="ETHUSD.D",
+            provider_code="D",
+            market_type=MarketType.SPOT,
+            base_asset="ETH",
+            quote_asset="USD",
+            symbol_on_exchange="ETH-USD",
+            is_perpetual=False,
+            margined=None,
+            oi_unit=None,
+            has_buy_sell_data=True,
+            has_ohlcv_data=True,
+            activation_status=ActivationStatus.ACTIVE,
+            shared_complete_from=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            shared_complete_to=datetime(2026, 4, 1, 1, 0, tzinfo=UTC),
+        )
+        history = {
+            (market.coinalyze_symbol, MetricName.OHLCV, Granularity.FIFTEEN_MIN): make_history(
+                datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+                4,
+                Granularity.FIFTEEN_MIN,
+            )
+        }
+        repository = FakeRepository()
+        repository.markets = [market]
+        repository.sync_states[(market.market_id, Granularity.FIFTEEN_MIN, MetricName.OHLCV)] = {
+            "market_id": market.market_id,
+            "granularity": Granularity.FIFTEEN_MIN,
+            "metric_name": MetricName.OHLCV,
+            "oldest_backfilled_bucket": datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            "newest_loaded_bucket": datetime(2026, 4, 1, 0, 15, tzinfo=UTC),
+            "retry_after_until": None,
+            "last_attempt_at": datetime(2026, 4, 1, 0, 15, tzinfo=UTC),
+            "last_error": None,
+        }
+        client = FakeClient(history)
+        service = WarehouseService(
+            client=client,
+            repository=repository,
+            settings=Settings(
+                database_url="postgresql://unused",
+                coinalyze_api_key="unused",
+                live_poll_lag_seconds=10.0,
+                live_lookback_closed_buckets=2,
+            ),
+            now=lambda: datetime(2026, 4, 1, 0, 45, 10, tzinfo=UTC),
+        )
+
+        service.sync_live_once()
+        first_bar_count = len(repository.ohlcv_store)
+        first_call_count = len(client.calls)
+        service.sync_live_once()
+
+        self.assertEqual(len(repository.ohlcv_store), first_bar_count)
+        self.assertEqual(len(client.calls), first_call_count)
+
+    def test_sync_closed_lane_waits_for_hour_close_plus_lag(self) -> None:
+        market = Market(
+            market_id=19,
+            coinalyze_symbol="ETHUSD.E",
+            provider_code="E",
+            market_type=MarketType.SPOT,
+            base_asset="ETH",
+            quote_asset="USD",
+            symbol_on_exchange="ETH-USD",
+            is_perpetual=False,
+            margined=None,
+            oi_unit=None,
+            has_buy_sell_data=True,
+            has_ohlcv_data=True,
+            activation_status=ActivationStatus.ACTIVE,
+            shared_complete_from=datetime(2026, 4, 1, 22, 0, tzinfo=UTC),
+            shared_complete_to=datetime(2026, 4, 2, 2, 0, tzinfo=UTC),
+        )
+        history = {
+            (market.coinalyze_symbol, MetricName.OHLCV, Granularity.ONE_HOUR): make_history(
+                datetime(2026, 4, 1, 22, 0, tzinfo=UTC),
+                4,
+                Granularity.ONE_HOUR,
+            )
+        }
+        repository = FakeRepository()
+        repository.markets = [market]
+        repository.sync_states[(market.market_id, Granularity.ONE_HOUR, MetricName.OHLCV)] = {
+            "market_id": market.market_id,
+            "granularity": Granularity.ONE_HOUR,
+            "metric_name": MetricName.OHLCV,
+            "oldest_backfilled_bucket": datetime(2026, 4, 1, 22, 0, tzinfo=UTC),
+            "newest_loaded_bucket": datetime(2026, 4, 1, 23, 0, tzinfo=UTC),
+            "retry_after_until": None,
+            "last_attempt_at": datetime(2026, 4, 1, 23, 0, tzinfo=UTC),
+            "last_error": None,
+        }
+        client = FakeClient(history)
+        service = WarehouseService(
+            client=client,
+            repository=repository,
+            settings=Settings(
+                database_url="postgresql://unused",
+                coinalyze_api_key="unused",
+                live_poll_lag_seconds=10.0,
+            ),
+            now=lambda: datetime(2026, 4, 2, 1, 0, 5, tzinfo=UTC),
+        )
+
+        service.sync_closed_lane(Granularity.ONE_HOUR, now=datetime(2026, 4, 2, 1, 0, 5, tzinfo=UTC))
+        self.assertEqual(repository.ohlcv_store, {})
+
+        service.sync_closed_lane(Granularity.ONE_HOUR, now=datetime(2026, 4, 2, 1, 0, 10, tzinfo=UTC))
+
+        self.assertIn(
+            (market.market_id, Granularity.ONE_HOUR, datetime(2026, 4, 2, 0, 0, tzinfo=UTC)),
+            repository.ohlcv_store,
+        )
+
+    def test_sync_live_once_rewrites_corrected_bar_in_trailing_window(self) -> None:
+        market = Market(
+            market_id=20,
+            coinalyze_symbol="ETHUSD.F",
+            provider_code="F",
+            market_type=MarketType.SPOT,
+            base_asset="ETH",
+            quote_asset="USD",
+            symbol_on_exchange="ETH-USD",
+            is_perpetual=False,
+            margined=None,
+            oi_unit=None,
+            has_buy_sell_data=True,
+            has_ohlcv_data=True,
+            activation_status=ActivationStatus.ACTIVE,
+            shared_complete_from=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            shared_complete_to=datetime(2026, 4, 1, 1, 0, tzinfo=UTC),
+        )
+        history = {
+            (market.coinalyze_symbol, MetricName.OHLCV, Granularity.FIFTEEN_MIN): make_history(
+                datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+                4,
+                Granularity.FIFTEEN_MIN,
+            )
+        }
+        repository = FakeRepository()
+        repository.markets = [market]
+        repository.sync_states[(market.market_id, Granularity.FIFTEEN_MIN, MetricName.OHLCV)] = {
+            "market_id": market.market_id,
+            "granularity": Granularity.FIFTEEN_MIN,
+            "metric_name": MetricName.OHLCV,
+            "oldest_backfilled_bucket": datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            "newest_loaded_bucket": datetime(2026, 4, 1, 0, 15, tzinfo=UTC),
+            "retry_after_until": None,
+            "last_attempt_at": datetime(2026, 4, 1, 0, 15, tzinfo=UTC),
+            "last_error": None,
+        }
+        client = FakeClient(history)
+        service = WarehouseService(
+            client=client,
+            repository=repository,
+            settings=Settings(
+                database_url="postgresql://unused",
+                coinalyze_api_key="unused",
+                live_poll_lag_seconds=10.0,
+                live_lookback_closed_buckets=2,
+            ),
+        )
+
+        service.sync_closed_lane(Granularity.FIFTEEN_MIN, now=datetime(2026, 4, 1, 0, 45, 10, tzinfo=UTC))
+        history[(market.coinalyze_symbol, MetricName.OHLCV, Granularity.FIFTEEN_MIN)] = make_history(
+            datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            5,
+            Granularity.FIFTEEN_MIN,
+            value_by_index={2: 9, 3: 4},
+        )
+
+        service.sync_closed_lane(Granularity.FIFTEEN_MIN, now=datetime(2026, 4, 1, 1, 0, 10, tzinfo=UTC))
+
+        corrected = repository.ohlcv_store[(market.market_id, Granularity.FIFTEEN_MIN, datetime(2026, 4, 1, 0, 30, tzinfo=UTC))]
+        newest = repository.ohlcv_store[(market.market_id, Granularity.FIFTEEN_MIN, datetime(2026, 4, 1, 0, 45, tzinfo=UTC))]
+        self.assertEqual(corrected.close, 9)
+        self.assertEqual(newest.close, 4)
+
+    def test_sync_closed_lane_keeps_spot_and_perp_processing_separate(self) -> None:
+        spot_market = Market(
+            market_id=21,
+            coinalyze_symbol="ETHUSD.G",
+            provider_code="G",
+            market_type=MarketType.SPOT,
+            base_asset="ETH",
+            quote_asset="USD",
+            symbol_on_exchange="ETH-USD",
+            is_perpetual=False,
+            margined=None,
+            oi_unit=None,
+            has_buy_sell_data=True,
+            has_ohlcv_data=True,
+            activation_status=ActivationStatus.ACTIVE,
+            shared_complete_from=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            shared_complete_to=datetime(2026, 4, 1, 1, 0, tzinfo=UTC),
+        )
+        perp_market = Market(
+            market_id=22,
+            coinalyze_symbol="ETHUSD_PERP.G",
+            provider_code="G",
+            market_type=MarketType.PERP,
+            base_asset="ETH",
+            quote_asset="USD",
+            symbol_on_exchange="ETHUSD_PERP",
+            is_perpetual=True,
+            margined="COIN",
+            oi_unit="QUOTE_ASSET",
+            has_buy_sell_data=True,
+            has_ohlcv_data=True,
+            activation_status=ActivationStatus.ACTIVE,
+            shared_complete_from=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            shared_complete_to=datetime(2026, 4, 1, 1, 0, tzinfo=UTC),
+        )
+        history = {
+            (spot_market.coinalyze_symbol, MetricName.OHLCV, Granularity.FIFTEEN_MIN): make_history(
+                datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+                4,
+                Granularity.FIFTEEN_MIN,
+            ),
+            (perp_market.coinalyze_symbol, MetricName.OHLCV, Granularity.FIFTEEN_MIN): make_history(
+                datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+                4,
+                Granularity.FIFTEEN_MIN,
+            ),
+            (perp_market.coinalyze_symbol, MetricName.OI_NATIVE, Granularity.FIFTEEN_MIN): make_history(
+                datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+                4,
+                Granularity.FIFTEEN_MIN,
+            ),
+            (perp_market.coinalyze_symbol, MetricName.OI_USD, Granularity.FIFTEEN_MIN): make_history(
+                datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+                4,
+                Granularity.FIFTEEN_MIN,
+                gap_indexes={1, 2},
+            ),
+            (perp_market.coinalyze_symbol, MetricName.FUNDING, Granularity.FIFTEEN_MIN): make_history(
+                datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+                4,
+                Granularity.FIFTEEN_MIN,
+            ),
+        }
+        repository = FakeRepository()
+        repository.markets = [spot_market, perp_market]
+        client = FakeClient(history)
+        service = WarehouseService(
+            client=client,
+            repository=repository,
+            settings=Settings(
+                database_url="postgresql://unused",
+                coinalyze_api_key="unused",
+                live_poll_lag_seconds=10.0,
+            ),
+        )
+
+        service.sync_closed_lane(Granularity.FIFTEEN_MIN, now=datetime(2026, 4, 1, 0, 45, 10, tzinfo=UTC))
+
+        self.assertTrue(any(call["symbols"] == (spot_market.coinalyze_symbol,) for call in client.calls))
+        self.assertTrue(any(call["symbols"] == (perp_market.coinalyze_symbol,) for call in client.calls))
+        self.assertIn(
+            (spot_market.market_id, Granularity.FIFTEEN_MIN, datetime(2026, 4, 1, 0, 30, tzinfo=UTC)),
+            repository.ohlcv_store,
+        )
+        self.assertEqual(repository.oi_store, {})
+        self.assertEqual(repository.funding_store, {})
+
+    def test_sync_closed_lane_records_batch_error_and_continues(self) -> None:
+        market_one = Market(
+            market_id=23,
+            coinalyze_symbol="ETHUSD.H",
+            provider_code="H",
+            market_type=MarketType.SPOT,
+            base_asset="ETH",
+            quote_asset="USD",
+            symbol_on_exchange="ETH-USD",
+            is_perpetual=False,
+            margined=None,
+            oi_unit=None,
+            has_buy_sell_data=True,
+            has_ohlcv_data=True,
+            activation_status=ActivationStatus.ACTIVE,
+            shared_complete_from=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            shared_complete_to=datetime(2026, 4, 1, 1, 0, tzinfo=UTC),
+        )
+        market_two = replace(market_one, market_id=24, coinalyze_symbol="ETHUSD.I", provider_code="I")
+        history = {
+            (market_one.coinalyze_symbol, MetricName.OHLCV, Granularity.FIFTEEN_MIN): make_history(
+                datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+                4,
+                Granularity.FIFTEEN_MIN,
+            ),
+            (market_two.coinalyze_symbol, MetricName.OHLCV, Granularity.FIFTEEN_MIN): make_history(
+                datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+                4,
+                Granularity.FIFTEEN_MIN,
+            ),
+        }
+        repository = FakeRepository()
+        repository.markets = [market_one, market_two]
+        client = FakeClient(
+            history,
+            max_symbols_per_request=1,
+            failures_by_request={
+                ((market_one.coinalyze_symbol,), MetricName.OHLCV, Granularity.FIFTEEN_MIN): CoinalyzeClientError("boom")
+            },
+        )
+        service = WarehouseService(
+            client=client,
+            repository=repository,
+            settings=Settings(
+                database_url="postgresql://unused",
+                coinalyze_api_key="unused",
+                live_poll_lag_seconds=10.0,
+            ),
+        )
+
+        service.sync_closed_lane(Granularity.FIFTEEN_MIN, now=datetime(2026, 4, 1, 0, 45, 10, tzinfo=UTC))
+
+        failed_state = repository.sync_states[(market_one.market_id, Granularity.FIFTEEN_MIN, MetricName.OHLCV)]
+        self.assertEqual(failed_state["last_error"], "boom")
+        self.assertIn(
+            (market_two.market_id, Granularity.FIFTEEN_MIN, datetime(2026, 4, 1, 0, 30, tzinfo=UTC)),
+            repository.ohlcv_store,
+        )
+
+    def test_sync_closed_lane_skips_market_with_future_retry_after_until(self) -> None:
+        market = Market(
+            market_id=25,
+            coinalyze_symbol="ETHUSD.J",
+            provider_code="J",
+            market_type=MarketType.SPOT,
+            base_asset="ETH",
+            quote_asset="USD",
+            symbol_on_exchange="ETH-USD",
+            is_perpetual=False,
+            margined=None,
+            oi_unit=None,
+            has_buy_sell_data=True,
+            has_ohlcv_data=True,
+            activation_status=ActivationStatus.ACTIVE,
+            shared_complete_from=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            shared_complete_to=datetime(2026, 4, 1, 1, 0, tzinfo=UTC),
+        )
+        history = {
+            (market.coinalyze_symbol, MetricName.OHLCV, Granularity.FIFTEEN_MIN): make_history(
+                datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+                4,
+                Granularity.FIFTEEN_MIN,
+            )
+        }
+        repository = FakeRepository()
+        repository.markets = [market]
+        repository.sync_states[(market.market_id, Granularity.FIFTEEN_MIN, MetricName.OHLCV)] = {
+            "market_id": market.market_id,
+            "granularity": Granularity.FIFTEEN_MIN,
+            "metric_name": MetricName.OHLCV,
+            "oldest_backfilled_bucket": datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            "newest_loaded_bucket": datetime(2026, 4, 1, 0, 15, tzinfo=UTC),
+            "retry_after_until": datetime(2026, 4, 1, 0, 50, tzinfo=UTC),
+            "last_attempt_at": datetime(2026, 4, 1, 0, 15, tzinfo=UTC),
+            "last_error": "429 Too Many Requests",
+        }
+        client = FakeClient(history)
+        service = WarehouseService(
+            client=client,
+            repository=repository,
+            settings=Settings(
+                database_url="postgresql://unused",
+                coinalyze_api_key="unused",
+                live_poll_lag_seconds=10.0,
+            ),
+        )
+
+        service.sync_closed_lane(Granularity.FIFTEEN_MIN, now=datetime(2026, 4, 1, 0, 45, 10, tzinfo=UTC))
+
+        self.assertEqual(client.calls, [])
+        self.assertEqual(repository.ohlcv_store, {})
+
+    def test_extend_active_markets_forward_batched_uses_grouped_history_requests(self) -> None:
+        spot_one = Market(
+            market_id=27,
+            coinalyze_symbol="ETHUSD.M",
+            provider_code="M",
+            market_type=MarketType.SPOT,
+            base_asset="ETH",
+            quote_asset="USD",
+            symbol_on_exchange="ETH-USD",
+            is_perpetual=False,
+            margined=None,
+            oi_unit=None,
+            has_buy_sell_data=True,
+            has_ohlcv_data=True,
+            activation_status=ActivationStatus.ACTIVE,
+            shared_complete_from=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            shared_complete_to=datetime(2026, 4, 3, 0, 0, tzinfo=UTC),
+        )
+        spot_two = replace(spot_one, market_id=28, coinalyze_symbol="ETHUSD.N", provider_code="N")
+        perp_one = Market(
+            market_id=29,
+            coinalyze_symbol="ETHUSD_PERP.M",
+            provider_code="M",
+            market_type=MarketType.PERP,
+            base_asset="ETH",
+            quote_asset="USD",
+            symbol_on_exchange="ETHUSD_PERP",
+            is_perpetual=True,
+            margined="COIN",
+            oi_unit="QUOTE_ASSET",
+            has_buy_sell_data=True,
+            has_ohlcv_data=True,
+            activation_status=ActivationStatus.ACTIVE,
+            shared_complete_from=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            shared_complete_to=datetime(2026, 4, 3, 0, 0, tzinfo=UTC),
+        )
+        perp_two = replace(perp_one, market_id=30, coinalyze_symbol="ETHUSD_PERP.N", provider_code="N")
+        history = {}
+        for market in (spot_one, spot_two):
+            for granularity, count in (
+                (Granularity.FIFTEEN_MIN, 6 * 24 * 4),
+                (Granularity.ONE_HOUR, 6 * 24),
+                (Granularity.DAILY, 6),
+            ):
+                history[(market.coinalyze_symbol, MetricName.OHLCV, granularity)] = make_history(
+                    datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+                    count,
+                    granularity,
+                )
+        for market in (perp_one, perp_two):
+            for metric_name in market.required_metrics:
+                for granularity, count in (
+                    (Granularity.FIFTEEN_MIN, 6 * 24 * 4),
+                    (Granularity.ONE_HOUR, 6 * 24),
+                    (Granularity.DAILY, 6),
+                ):
+                    history[(market.coinalyze_symbol, metric_name, granularity)] = make_history(
+                        datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+                        count,
+                        granularity,
+                    )
+        repository = FakeRepository()
+        repository.markets = [spot_one, spot_two, perp_one, perp_two]
+        client = FakeClient(history)
+        service = WarehouseService(
+            client=client,
+            repository=repository,
+            settings=Settings(
+                database_url="postgresql://unused",
+                coinalyze_api_key="unused",
+                probe_chunk_days=2,
+            ),
+            now=lambda: datetime(2026, 4, 6, 12, 0, tzinfo=UTC),
+        )
+
+        updated = service.extend_active_markets_forward_batched()
+
+        self.assertEqual(len(client.calls), 15)
+        self.assertTrue(any(call["symbols"] == (spot_one.coinalyze_symbol, spot_two.coinalyze_symbol) for call in client.calls))
+        self.assertTrue(any(call["symbols"] == (perp_one.coinalyze_symbol, perp_two.coinalyze_symbol) for call in client.calls))
+        self.assertTrue(any(market.shared_complete_to > datetime(2026, 4, 3, 0, 0, tzinfo=UTC) for market in updated))
+
+    def test_refresh_active_markets_skips_spot_when_latest_bucket_already_loaded(self) -> None:
+        market = Market(
+            market_id=31,
+            coinalyze_symbol="ETHUSD.P",
+            provider_code="P",
+            market_type=MarketType.SPOT,
+            base_asset="ETH",
+            quote_asset="USD",
+            symbol_on_exchange="ETH-USD",
+            is_perpetual=False,
+            margined=None,
+            oi_unit=None,
+            has_buy_sell_data=True,
+            has_ohlcv_data=True,
+            required_granularities=(Granularity.ONE_HOUR,),
+            activation_status=ActivationStatus.ACTIVE,
+            shared_complete_from=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            shared_complete_to=datetime(2026, 4, 7, 0, 0, tzinfo=UTC),
+        )
+        repository = FakeRepository()
+        repository.markets = [market]
+        repository.sync_states[(market.market_id, Granularity.ONE_HOUR, MetricName.OHLCV)] = {
+            "market_id": market.market_id,
+            "granularity": Granularity.ONE_HOUR,
+            "metric_name": MetricName.OHLCV,
+            "oldest_backfilled_bucket": datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            "newest_loaded_bucket": datetime(2026, 4, 6, 23, 0, tzinfo=UTC),
+            "retry_after_until": None,
+            "last_attempt_at": datetime(2026, 4, 7, 0, 0, tzinfo=UTC),
+            "last_error": None,
+        }
+        client = FakeClient({})
+        service = WarehouseService(
+            client=client,
+            repository=repository,
+            settings=Settings(database_url="postgresql://unused", coinalyze_api_key="unused"),
+            now=lambda: datetime(2026, 4, 7, 1, 0, tzinfo=UTC),
+        )
+
+        service.refresh_active_markets()
+
+        self.assertEqual(client.calls, [])
+
+    def test_refresh_active_markets_skips_perp_when_all_metrics_are_current(self) -> None:
+        market = Market(
+            market_id=32,
+            coinalyze_symbol="ETHUSD_PERP.P",
+            provider_code="P",
+            market_type=MarketType.PERP,
+            base_asset="ETH",
+            quote_asset="USD",
+            symbol_on_exchange="ETHUSD_PERP",
+            is_perpetual=True,
+            margined="COIN",
+            oi_unit="QUOTE_ASSET",
+            has_buy_sell_data=True,
+            has_ohlcv_data=True,
+            required_granularities=(Granularity.FIFTEEN_MIN,),
+            activation_status=ActivationStatus.ACTIVE,
+            shared_complete_from=datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+            shared_complete_to=datetime(2026, 4, 7, 0, 0, tzinfo=UTC),
+        )
+        repository = FakeRepository()
+        repository.markets = [market]
+        for metric_name in market.required_metrics:
+            repository.sync_states[(market.market_id, Granularity.FIFTEEN_MIN, metric_name)] = {
+                "market_id": market.market_id,
+                "granularity": Granularity.FIFTEEN_MIN,
+                "metric_name": metric_name,
+                "oldest_backfilled_bucket": datetime(2026, 4, 1, 0, 0, tzinfo=UTC),
+                "newest_loaded_bucket": datetime(2026, 4, 6, 23, 45, tzinfo=UTC),
+                "retry_after_until": None,
+                "last_attempt_at": datetime(2026, 4, 7, 0, 0, tzinfo=UTC),
+                "last_error": None,
+            }
+        client = FakeClient({})
+        service = WarehouseService(
+            client=client,
+            repository=repository,
+            settings=Settings(database_url="postgresql://unused", coinalyze_api_key="unused"),
+            now=lambda: datetime(2026, 4, 7, 0, 10, tzinfo=UTC),
+        )
+
+        service.refresh_active_markets()
+
+        self.assertEqual(client.calls, [])

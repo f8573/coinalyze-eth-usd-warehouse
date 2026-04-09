@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: coinalyze-eth-usd-warehouse-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: coinalyze_eth_usd_warehouse
+      POSTGRES_USER: warehouse
+      POSTGRES_PASSWORD: warehouse_dev_password
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U warehouse -d coinalyze_eth_usd_warehouse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:

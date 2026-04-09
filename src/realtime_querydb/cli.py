@@ -12,7 +12,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ETH-USD Coinalyze warehouse CLI")
     parser.add_argument(
         "command",
-        choices=("init-db", "discover", "evaluate", "backfill", "backfill-pending", "extend-active", "refresh", "sync-all", "sync-daily"),
+        choices=("init-db", "discover", "evaluate", "backfill", "backfill-pending", "extend-active", "refresh", "sync-all", "sync-daily", "sync-live"),
         help="Command to execute.",
     )
     return parser
@@ -53,5 +53,7 @@ def main() -> None:
         service.sync_all()
     elif command == "sync-daily":
         service.sync_daily()
+    elif command == "sync-live":
+        service.run_live_forever()
     else:
         parser.error(f"Unsupported command: {command}")

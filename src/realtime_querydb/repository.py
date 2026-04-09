@@ -226,8 +226,36 @@ class WarehouseRepository:
                 retry_after_until=row["retry_after_until"],
                 last_attempt_at=row["last_attempt_at"],
                 last_error=row["last_error"],
-            )
+                )
         return states
+
+    def get_loaded_bucket_bounds(
+        self,
+        *,
+        market_id: int,
+        granularity: Granularity,
+        metric_name: MetricName,
+    ) -> tuple[datetime, datetime] | None:
+        table_name = self._fact_table_for_metric(metric_name)
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT
+                        MIN(bucket_start) AS oldest_bucket_start,
+                        MAX(bucket_start) AS newest_bucket_start
+                    FROM {table_name}
+                    WHERE market_id = %s
+                      AND granularity = %s
+                    """,
+                    (market_id, granularity.value),
+                )
+                row = cursor.fetchone()
+        oldest_bucket_start = row["oldest_bucket_start"]
+        newest_bucket_start = row["newest_bucket_start"]
+        if oldest_bucket_start is None or newest_bucket_start is None:
+            return None
+        return oldest_bucket_start, newest_bucket_start
 
     def set_market_activation(
         self,
@@ -466,3 +494,13 @@ class WarehouseRepository:
                     rows,
                 )
             connection.commit()
+
+    @staticmethod
+    def _fact_table_for_metric(metric_name: MetricName) -> str:
+        if metric_name is MetricName.OHLCV:
+            return "ohlcv_fact"
+        if metric_name in (MetricName.OI_NATIVE, MetricName.OI_USD):
+            return "open_interest_fact"
+        if metric_name is MetricName.FUNDING:
+            return "funding_rate_fact"
+        raise ValueError(f"Unsupported metric for fact lookup: {metric_name}")

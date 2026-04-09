@@ -32,6 +32,29 @@ class SettingsFromEnvTests(unittest.TestCase):
             self.assertEqual(settings.database_url, "postgresql://user:pass@localhost:5432/warehouse")
             self.assertEqual(settings.coinalyze_api_key, "test-key")
 
+    def test_from_env_overrides_existing_environment_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "DATABASE_URL=postgresql://dotenv:dotenv@localhost:5432/warehouse\n"
+                "COINALYZE_API_KEY=dotenv-key\n",
+                encoding="utf-8",
+            )
+            previous_cwd = Path.cwd()
+            previous_database_url = os.environ.get("DATABASE_URL")
+            previous_api_key = os.environ.get("COINALYZE_API_KEY")
+            try:
+                os.chdir(temp_dir)
+                os.environ["DATABASE_URL"] = "postgresql://env:env@localhost:5432/warehouse"
+                os.environ["COINALYZE_API_KEY"] = "env-key"
+                settings = Settings.from_env()
+            finally:
+                os.chdir(previous_cwd)
+                _restore_env("DATABASE_URL", previous_database_url)
+                _restore_env("COINALYZE_API_KEY", previous_api_key)
+            self.assertEqual(settings.database_url, "postgresql://dotenv:dotenv@localhost:5432/warehouse")
+            self.assertEqual(settings.coinalyze_api_key, "dotenv-key")
+
     def test_from_env_rejects_blank_required_values(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"

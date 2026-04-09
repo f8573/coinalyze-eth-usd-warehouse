@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import time
+from collections import defaultdict
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 
-from .coinalyze import CoinalyzeClient
+from .coinalyze import CoinalyzeClient, CoinalyzeClientError
 from .config import Settings
 from .models import (
     ActivationStatus,
@@ -179,11 +181,13 @@ class WarehouseService:
         repository: WarehouseRepository,
         settings: Settings,
         now: Callable[[], datetime] | None = None,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self._client = client
         self._repository = repository
         self._settings = settings
         self._now = now or (lambda: datetime.now(UTC))
+        self._sleep = sleep or time.sleep
 
     def init_db(self) -> None:
         self._repository.apply_schema()
@@ -289,6 +293,7 @@ class WarehouseService:
     def backfill_pending_active_markets(self, max_chunks_per_market: int | None = None) -> None:
         chunk_limit = max_chunks_per_market if max_chunks_per_market is not None else self._settings.max_backfill_chunks_per_market_per_run
         for market in self._repository.list_markets(ActivationStatus.ACTIVE):
+            self._bootstrap_sync_state_from_facts(market)
             self.backfill_market_pending(market, max_chunks_per_market=chunk_limit)
 
     def extend_active_markets(self) -> list[Market]:
@@ -315,6 +320,43 @@ class WarehouseService:
             return market
         checked_at = self._now()
         updated = replace(market, eligibility_checked_at=checked_at)
+        self._repository.set_market_activation(
+            market_id=updated.market_id,
+            status=updated.activation_status,
+            checked_at=checked_at,
+            shared_from=updated.shared_complete_from,
+            shared_to=updated.shared_complete_to,
+            exclusion_reason=updated.exclusion_reason,
+        )
+        return updated
+
+    def _extend_active_market_forward_from_windows(
+        self,
+        market: Market,
+        *,
+        windows_by_series: dict[tuple[str, Granularity, MetricName], SeriesWindow],
+    ) -> Market:
+        if market.market_id is None:
+            raise ValueError("Market must have a database id before extending.")
+        if market.shared_complete_from is None or market.shared_complete_to is None:
+            return market
+        windows: list[SeriesWindow] = []
+        for granularity in market.required_granularities:
+            series_edge_end = last_bucket_start_within_window(market.shared_complete_to, granularity) + granularity.delta
+            for metric_name in market.required_metrics:
+                window = windows_by_series.get((market.coinalyze_symbol, granularity, metric_name))
+                if window is None or window.start > series_edge_end:
+                    return market
+                windows.append(window)
+        shared_window = compute_shared_window(windows)
+        if shared_window is None or shared_window[0] > market.shared_complete_to or shared_window[1] <= market.shared_complete_to:
+            return market
+        checked_at = self._now()
+        updated = replace(
+            market,
+            eligibility_checked_at=checked_at,
+            shared_complete_to=shared_window[1],
+        )
         self._repository.set_market_activation(
             market_id=updated.market_id,
             status=updated.activation_status,
@@ -392,6 +434,8 @@ class WarehouseService:
         active_markets = self._repository.list_markets(ActivationStatus.ACTIVE)
         if not active_markets:
             return
+        for market in active_markets:
+            self._bootstrap_sync_state_from_facts(market)
         self._refresh_recent_batches(active_markets)
 
     def sync_all(self) -> None:
@@ -404,9 +448,333 @@ class WarehouseService:
     def sync_daily(self) -> None:
         self.discover_markets()
         self.evaluate_candidates(limit=self._settings.max_candidate_markets_per_run)
-        self.extend_active_markets()
+        self.extend_active_markets_forward_batched()
         self.backfill_pending_active_markets(self._settings.max_backfill_chunks_per_market_per_run)
         self.refresh_active_markets()
+
+    def extend_active_markets_forward_batched(self) -> list[Market]:
+        active_markets = self._repository.list_markets(ActivationStatus.ACTIVE)
+        if not active_markets:
+            return []
+        windows_by_series = self._collect_recent_active_windows(active_markets)
+        updated_markets: list[Market] = []
+        for market in active_markets:
+            updated_markets.append(
+                self._extend_active_market_forward_from_windows(
+                    market,
+                    windows_by_series=windows_by_series,
+                )
+            )
+        return updated_markets
+
+    def sync_live_once(self, now: datetime | None = None) -> None:
+        live_now = self._coerce_utc_now(now)
+        for granularity in Granularity.required():
+            self.sync_closed_lane(granularity, now=live_now)
+
+    def run_live_forever(self) -> None:
+        while True:
+            self.sync_live_once()
+            sleep_seconds = self._seconds_until_next_live_wake(self._now())
+            if sleep_seconds <= 0:
+                sleep_seconds = self._settings.live_idle_sleep_seconds
+            self._sleep(sleep_seconds)
+
+    def sync_closed_lane(self, granularity: Granularity, *, now: datetime | None = None) -> None:
+        lane_now = self._coerce_utc_now(now)
+        latest_closed_bucket = self._latest_live_closed_bucket_start(lane_now, granularity)
+        active_markets = self._repository.list_markets(ActivationStatus.ACTIVE)
+        if not active_markets:
+            return
+        spot_windows: dict[tuple[datetime, datetime], list[Market]] = defaultdict(list)
+        perp_windows: dict[tuple[datetime, datetime], list[Market]] = defaultdict(list)
+        for market in active_markets:
+            if market.market_id is None or market.shared_complete_from is None or market.shared_complete_to is None:
+                continue
+            sync_states = self._repository.list_sync_states(market.market_id)
+            window = self._next_live_window(
+                market,
+                granularity,
+                sync_states,
+                latest_closed_bucket=latest_closed_bucket,
+                now=lane_now,
+            )
+            if window is None:
+                continue
+            if market.market_type is MarketType.SPOT:
+                spot_windows[window].append(market)
+            else:
+                perp_windows[window].append(market)
+        for window, markets in spot_windows.items():
+            self._sync_live_spot_window(markets, granularity=granularity, window=window, now=lane_now)
+        for window, markets in perp_windows.items():
+            self._sync_live_perp_window(markets, granularity=granularity, window=window, now=lane_now)
+
+    def _coerce_utc_now(self, now: datetime | None) -> datetime:
+        current = now or self._now()
+        return current.astimezone(UTC)
+
+    def _latest_live_closed_bucket_start(self, now: datetime, granularity: Granularity) -> datetime:
+        effective_now = now - timedelta(seconds=self._settings.live_poll_lag_seconds)
+        return last_closed_bucket_start(effective_now, granularity)
+
+    def _seconds_until_next_live_wake(self, now: datetime) -> float:
+        current = self._coerce_utc_now(now)
+        lag = timedelta(seconds=self._settings.live_poll_lag_seconds)
+        wake_times = [
+            floor_bucket_start(current, granularity) + granularity.delta + lag
+            for granularity in Granularity.required()
+        ]
+        return max(min((wake_time - current).total_seconds() for wake_time in wake_times), 0.0)
+
+    def _next_live_window(
+        self,
+        market: Market,
+        granularity: Granularity,
+        sync_states,
+        *,
+        latest_closed_bucket: datetime,
+        now: datetime,
+    ) -> tuple[datetime, datetime] | None:
+        if market.shared_complete_from is None or market.shared_complete_to is None:
+            return None
+        first_bucket = first_bucket_start_within_window(market.shared_complete_from, granularity)
+        last_shared_bucket = last_bucket_start_within_window(market.shared_complete_to, granularity)
+        target_bucket = min(latest_closed_bucket, last_shared_bucket)
+        if target_bucket < first_bucket:
+            return None
+        required_states = [
+            sync_states.get((granularity, metric_name))
+            for metric_name in market.required_metrics
+        ]
+        if any(
+            state is not None
+            and state.retry_after_until is not None
+            and state.retry_after_until > now
+            for state in required_states
+        ):
+            return None
+        if any(state is None or state.newest_loaded_bucket is None for state in required_states):
+            next_bucket = target_bucket
+        else:
+            newest_loaded_bucket = min(state.newest_loaded_bucket for state in required_states)
+            if newest_loaded_bucket >= target_bucket:
+                return None
+            next_bucket = newest_loaded_bucket + granularity.delta
+        if next_bucket > target_bucket:
+            return None
+        lookback_buckets = max(self._settings.live_lookback_closed_buckets, 1)
+        start_bucket = max(first_bucket, next_bucket - (granularity.delta * (lookback_buckets - 1)))
+        end_exclusive = next_bucket + granularity.delta
+        return start_bucket, end_exclusive
+
+    def _sync_live_spot_window(
+        self,
+        markets: Sequence[Market],
+        *,
+        granularity: Granularity,
+        window: tuple[datetime, datetime],
+        now: datetime,
+    ) -> None:
+        start, end_exclusive = window
+        end_inclusive = history_request_to_inclusive(end_exclusive, granularity)
+        for batch in iter_batches(list(markets), self._client.max_symbols_per_request):
+            histories = self._fetch_live_batch_histories(
+                batch,
+                metric_name=MetricName.OHLCV,
+                granularity=granularity,
+                start=start,
+                end_inclusive=end_inclusive,
+                attempted_at=now,
+            )
+            if histories is None:
+                continue
+            for market in batch:
+                if market.market_id is None or market.shared_complete_from is None or market.shared_complete_to is None:
+                    continue
+                bars = [
+                    OhlcvBar.from_api(item, market.has_buy_sell_data)
+                    for item in histories.get(market.coinalyze_symbol, [])
+                ]
+                filtered = [
+                    bar
+                    for bar in bars
+                    if bar.bucket_start >= market.shared_complete_from
+                    and bar.bucket_start + granularity.delta <= market.shared_complete_to
+                ]
+                self._repository.upsert_ohlcv_bars(
+                    market_id=market.market_id,
+                    granularity=granularity,
+                    bars=filtered,
+                )
+                self._update_sync_success(market.market_id, granularity, MetricName.OHLCV, filtered)
+
+    def _sync_live_perp_window(
+        self,
+        markets: Sequence[Market],
+        *,
+        granularity: Granularity,
+        window: tuple[datetime, datetime],
+        now: datetime,
+    ) -> None:
+        start, end_exclusive = window
+        end_inclusive = history_request_to_inclusive(end_exclusive, granularity)
+        for batch in iter_batches(list(markets), self._client.max_symbols_per_request):
+            ohlcv_histories = self._fetch_live_batch_histories(
+                batch,
+                metric_name=MetricName.OHLCV,
+                granularity=granularity,
+                start=start,
+                end_inclusive=end_inclusive,
+                attempted_at=now,
+            )
+            if ohlcv_histories is None:
+                continue
+            oi_native_histories = self._fetch_live_batch_histories(
+                batch,
+                metric_name=MetricName.OI_NATIVE,
+                granularity=granularity,
+                start=start,
+                end_inclusive=end_inclusive,
+                attempted_at=now,
+            )
+            if oi_native_histories is None:
+                continue
+            oi_usd_histories = self._fetch_live_batch_histories(
+                batch,
+                metric_name=MetricName.OI_USD,
+                granularity=granularity,
+                start=start,
+                end_inclusive=end_inclusive,
+                attempted_at=now,
+            )
+            if oi_usd_histories is None:
+                continue
+            funding_histories = self._fetch_live_batch_histories(
+                batch,
+                metric_name=MetricName.FUNDING,
+                granularity=granularity,
+                start=start,
+                end_inclusive=end_inclusive,
+                attempted_at=now,
+            )
+            if funding_histories is None:
+                continue
+            for market in batch:
+                if market.market_id is None or market.shared_complete_from is None or market.shared_complete_to is None:
+                    continue
+                ohlcv_map = {
+                    datetime.fromtimestamp(int(item["t"]), UTC): item
+                    for item in ohlcv_histories.get(market.coinalyze_symbol, [])
+                }
+                oi_native_map = {
+                    datetime.fromtimestamp(int(item["t"]), UTC): item
+                    for item in oi_native_histories.get(market.coinalyze_symbol, [])
+                }
+                oi_usd_map = {
+                    datetime.fromtimestamp(int(item["t"]), UTC): item
+                    for item in oi_usd_histories.get(market.coinalyze_symbol, [])
+                }
+                funding_map = {
+                    datetime.fromtimestamp(int(item["t"]), UTC): item
+                    for item in funding_histories.get(market.coinalyze_symbol, [])
+                }
+                timestamps = filter_windowed_timestamps(
+                    set(ohlcv_map).intersection(oi_native_map, oi_usd_map, funding_map),
+                    granularity=granularity,
+                    shared_from=market.shared_complete_from,
+                    shared_to=market.shared_complete_to,
+                )
+                ohlcv_bars = [OhlcvBar.from_api(ohlcv_map[timestamp], market.has_buy_sell_data) for timestamp in timestamps]
+                open_interest_bars = [
+                    OpenInterestBar(
+                        bucket_start=timestamp,
+                        native_open=float(oi_native_map[timestamp]["o"]),
+                        native_high=float(oi_native_map[timestamp]["h"]),
+                        native_low=float(oi_native_map[timestamp]["l"]),
+                        native_close=float(oi_native_map[timestamp]["c"]),
+                        usd_open=float(oi_usd_map[timestamp]["o"]),
+                        usd_high=float(oi_usd_map[timestamp]["h"]),
+                        usd_low=float(oi_usd_map[timestamp]["l"]),
+                        usd_close=float(oi_usd_map[timestamp]["c"]),
+                    )
+                    for timestamp in timestamps
+                ]
+                funding_bars = [FundingRateBar.from_api(funding_map[timestamp]) for timestamp in timestamps]
+                self._repository.upsert_ohlcv_bars(
+                    market_id=market.market_id,
+                    granularity=granularity,
+                    bars=ohlcv_bars,
+                )
+                self._repository.upsert_open_interest_bars(
+                    market_id=market.market_id,
+                    granularity=granularity,
+                    bars=open_interest_bars,
+                )
+                self._repository.upsert_funding_rate_bars(
+                    market_id=market.market_id,
+                    granularity=granularity,
+                    bars=funding_bars,
+                )
+                self._update_sync_success(market.market_id, granularity, MetricName.OHLCV, ohlcv_bars)
+                self._update_sync_success(market.market_id, granularity, MetricName.OI_NATIVE, open_interest_bars)
+                self._update_sync_success(market.market_id, granularity, MetricName.OI_USD, open_interest_bars)
+                self._update_sync_success(market.market_id, granularity, MetricName.FUNDING, funding_bars)
+
+    def _fetch_live_batch_histories(
+        self,
+        markets: Sequence[Market],
+        *,
+        metric_name: MetricName,
+        granularity: Granularity,
+        start: datetime,
+        end_inclusive: datetime,
+        attempted_at: datetime,
+    ) -> dict[str, list[dict[str, object]]] | None:
+        market_ids = [market.market_id for market in markets if market.market_id is not None]
+        try:
+            return self._client.get_history(
+                symbols=[market.coinalyze_symbol for market in markets],
+                metric_name=metric_name,
+                granularity=granularity,
+                start=start,
+                end_inclusive=end_inclusive,
+                on_retry_after=self._retry_notifier_for_batch(
+                    market_ids,
+                    granularity,
+                    metric_name,
+                ),
+            )
+        except CoinalyzeClientError as exc:
+            self._record_sync_error(
+                market_ids,
+                granularity=granularity,
+                metric_name=metric_name,
+                message=str(exc),
+                attempted_at=attempted_at,
+            )
+            return None
+
+    def _record_sync_error(
+        self,
+        market_ids: Sequence[int],
+        *,
+        granularity: Granularity,
+        metric_name: MetricName,
+        message: str,
+        attempted_at: datetime,
+    ) -> None:
+        for market_id in market_ids:
+            self._repository.upsert_sync_state(
+                market_id=market_id,
+                granularity=granularity,
+                metric_name=metric_name,
+                oldest_backfilled_bucket=None,
+                newest_loaded_bucket=None,
+                retry_after_until=None,
+                last_attempt_at=attempted_at,
+                last_error=message,
+            )
 
     def backfill_market(self, market: Market) -> None:
         if market.market_id is None:
@@ -502,6 +870,39 @@ class WarehouseService:
             return None
         return chunk_start, chunk_end
 
+    def _bootstrap_sync_state_from_facts(self, market: Market) -> None:
+        if market.market_id is None:
+            return
+        sync_states = self._repository.list_sync_states(market.market_id)
+        updated_at = self._now()
+        for granularity in market.required_granularities:
+            for metric_name in market.required_metrics:
+                state = sync_states.get((granularity, metric_name))
+                if (
+                    state is not None
+                    and state.oldest_backfilled_bucket is not None
+                    and state.newest_loaded_bucket is not None
+                ):
+                    continue
+                bounds = self._repository.get_loaded_bucket_bounds(
+                    market_id=market.market_id,
+                    granularity=granularity,
+                    metric_name=metric_name,
+                )
+                if bounds is None:
+                    continue
+                oldest_bucket_start, newest_bucket_start = bounds
+                self._repository.upsert_sync_state(
+                    market_id=market.market_id,
+                    granularity=granularity,
+                    metric_name=metric_name,
+                    oldest_backfilled_bucket=oldest_bucket_start,
+                    newest_loaded_bucket=newest_bucket_start,
+                    retry_after_until=None,
+                    last_attempt_at=updated_at,
+                    last_error=None,
+                )
+
     def _collect_recent_candidate_windows(
         self,
         markets: Sequence[Market],
@@ -553,15 +954,87 @@ class WarehouseService:
                             recent_windows[(market.coinalyze_symbol, granularity, metric_name)] = window
         return recent_windows
 
+    def _collect_recent_active_windows(
+        self,
+        markets: Sequence[Market],
+    ) -> dict[tuple[str, Granularity, MetricName], SeriesWindow]:
+        active_windows: dict[tuple[str, Granularity, MetricName], SeriesWindow] = {}
+        now = self._now()
+        spot_markets = [market for market in markets if market.market_type is MarketType.SPOT and market.shared_complete_to is not None]
+        perp_markets = [market for market in markets if market.market_type is MarketType.PERP and market.shared_complete_to is not None]
+        for granularity in Granularity.required():
+            end_inclusive = last_closed_bucket_start(now, granularity)
+            if spot_markets:
+                spot_start = min(
+                    max(UNIX_EPOCH, last_bucket_start_within_window(market.shared_complete_to, granularity) - timedelta(days=self._settings.probe_chunk_days))
+                    for market in spot_markets
+                )
+                spot_histories = self._fetch_batch_histories(
+                    spot_markets,
+                    metric_name=MetricName.OHLCV,
+                    granularity=granularity,
+                    start=spot_start,
+                    end_inclusive=end_inclusive,
+                )
+                for market in spot_markets:
+                    window = build_contiguous_suffix_window(
+                        metric_name=MetricName.OHLCV,
+                        granularity=granularity,
+                        history=spot_histories.get(market.coinalyze_symbol, []),
+                    )
+                    if window is not None:
+                        active_windows[(market.coinalyze_symbol, granularity, MetricName.OHLCV)] = window
+            if perp_markets:
+                perp_start = min(
+                    max(UNIX_EPOCH, last_bucket_start_within_window(market.shared_complete_to, granularity) - timedelta(days=self._settings.probe_chunk_days))
+                    for market in perp_markets
+                )
+                for metric_name in (
+                    MetricName.OHLCV,
+                    MetricName.OI_NATIVE,
+                    MetricName.OI_USD,
+                    MetricName.FUNDING,
+                ):
+                    perp_histories = self._fetch_batch_histories(
+                        perp_markets,
+                        metric_name=metric_name,
+                        granularity=granularity,
+                        start=perp_start,
+                        end_inclusive=end_inclusive,
+                    )
+                    for market in perp_markets:
+                        window = build_contiguous_suffix_window(
+                            metric_name=metric_name,
+                            granularity=granularity,
+                            history=perp_histories.get(market.coinalyze_symbol, []),
+                        )
+                        if window is not None:
+                            active_windows[(market.coinalyze_symbol, granularity, metric_name)] = window
+        return active_windows
+
     def _refresh_recent_batches(self, markets: Sequence[Market]) -> None:
         now = self._now()
-        spot_markets = [market for market in markets if market.market_type is MarketType.SPOT]
-        perp_markets = [market for market in markets if market.market_type is MarketType.PERP]
         for granularity in Granularity.required():
             last_closed = last_closed_bucket_start(now, granularity)
             end_exclusive = last_closed + granularity.delta
             start = end_exclusive - (granularity.delta * granularity.refresh_lookback_bars)
             end_inclusive = history_request_to_inclusive(end_exclusive, granularity)
+            spot_markets: list[Market] = []
+            perp_markets: list[Market] = []
+            for market in markets:
+                if market.market_id is None or market.shared_complete_from is None or market.shared_complete_to is None:
+                    continue
+                if not self._market_needs_refresh(
+                    market,
+                    granularity=granularity,
+                    refresh_start=start,
+                    refresh_end=end_exclusive,
+                ):
+                    continue
+                if market.market_type is MarketType.SPOT:
+                    spot_markets.append(market)
+                else:
+                    perp_markets.append(market)
             if spot_markets:
                 spot_histories = self._fetch_batch_histories(
                     spot_markets,
@@ -674,6 +1147,27 @@ class WarehouseService:
                     self._update_sync_success(market.market_id, granularity, MetricName.OI_NATIVE, open_interest_bars)
                     self._update_sync_success(market.market_id, granularity, MetricName.OI_USD, open_interest_bars)
                     self._update_sync_success(market.market_id, granularity, MetricName.FUNDING, funding_bars)
+
+    def _market_needs_refresh(
+        self,
+        market: Market,
+        *,
+        granularity: Granularity,
+        refresh_start: datetime,
+        refresh_end: datetime,
+    ) -> bool:
+        if granularity not in market.required_granularities:
+            return False
+        if market.market_id is None or market.shared_complete_from is None or market.shared_complete_to is None:
+            return False
+        chunk_start = max(refresh_start, market.shared_complete_from)
+        chunk_end = min(refresh_end, market.shared_complete_to)
+        if chunk_start >= chunk_end:
+            return False
+        target_last_bucket = last_bucket_start_within_window(chunk_end, granularity)
+        sync_states = self._repository.list_sync_states(market.market_id)
+        required_states = [sync_states.get((granularity, metric_name)) for metric_name in market.required_metrics]
+        return any(state is None or state.newest_loaded_bucket is None or state.newest_loaded_bucket < target_last_bucket for state in required_states)
 
     def _fetch_batch_histories(
         self,

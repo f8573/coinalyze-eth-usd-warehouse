@@ -64,6 +64,12 @@ Refresh recent closed bars:
 coinalyze-eth-usd-warehouse refresh
 ```
 
+Run the live closed-bar ingester:
+
+```powershell
+coinalyze-eth-usd-warehouse sync-live
+```
+
 Run the daily rerunnable pipeline:
 
 ```powershell
@@ -77,6 +83,13 @@ coinalyze-eth-usd-warehouse sync-daily
 3. active-window extension
 4. pending chunk loading for both left-edge history and right-edge catch-up
 5. recent-bar refresh
+
+Optional live-ingest settings:
+
+- `LIVE_POLL_LAG_SECONDS` defaults to `10.0`
+- `LIVE_LOOKBACK_CLOSED_BUCKETS` defaults to `2`
+- `LIVE_IDLE_SLEEP_SECONDS` defaults to `5.0`
+- `MIN_REQUEST_INTERVAL_SECONDS` defaults to `20.0`
 
 Run the full pipeline:
 
